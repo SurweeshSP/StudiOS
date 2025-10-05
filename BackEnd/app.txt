@@ -1,0 +1,225 @@
+import os,io, tempfile
+import sys
+import threading
+from flask import Flask, request, jsonify, render_template, send_file, Response
+from deepface import DeepFace
+from transformers import pipeline
+import cv2
+from dotenv import load_dotenv
+from sqlalchemy import text
+from config.db import init_db, db
+from ML.dags.textemotion import predict_textemotion
+from ML.dags.videoemotion import start_video_emotion
+from ML.dags.audioemotion import process_uploaded_audio
+import requests
+import google.generativeai as genai
+
+# Load env variables
+load_dotenv()
+
+# Ensure ML path is available
+sys.path.append(os.path.join(os.path.dirname(__file__), "ML", "dags"))
+
+app = Flask(__name__)
+
+# Initialize DB
+init_db(app)
+
+# Check DB connection at startup
+with app.app_context():
+    try:
+        db.session.execute(text("SELECT 1"))
+        print("Database connection successful")
+    except Exception as e:
+        print("Database connection failed:", e)
+
+
+# Load model once
+sentiment_analyzer = pipeline(
+    task="text-classification",
+    model="SamLowe/roberta-base-go_emotions",
+    top_k=None,
+    framework="pt",
+)
+
+def analyze_text_sentiment(text):
+    result = sentiment_analyzer(text)
+    return result[0]
+
+def generate_frames():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+        try:
+            result = DeepFace.analyze(img_path=frame, actions=['emotion'], enforce_detection=False)
+            dominant_emotion = result[0]['dominant_emotion']
+            cv2.putText(frame, f"Emotion: {dominant_emotion}", (30, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        except:
+            pass
+        _, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return render_template("index.html")
+
+
+@app.route("/chat", methods=["POST"])
+def text():
+    try:
+        data = request.get_json()
+        if not data or "text" not in data:
+            return jsonify({"error": "Pls provide a text"}), 400
+
+        text = data["text"]
+        result = predict_textemotion(text)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/video", methods=["GET"])
+def video():
+    try:
+        thread = threading.Thread(target=start_video_emotion)
+        thread.start()
+        return jsonify({"status": "Video stream started.. Press q to exit"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Health check route
+@app.route("/health", methods=["GET"])
+def health_check():
+    try:
+        db.session.execute(text("SELECT 1"))
+        return jsonify({"status": "healthy", "db": "connected"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "db_error": str(e)}), 500
+
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+audio_cache = None
+audio_emotion = None
+
+@app.route("/audio", methods=["POST"])
+def handle_audio():
+    global audio_cache, audio_emotion
+
+    file = request.files.get("file")
+    save_flag = request.form.get("save", "false").lower() == "true"
+
+    if not file:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    # Read into memory
+    audio_cache = file.read()
+
+    # Save to a temp file for processing
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        tmp.write(audio_cache)
+        tmp_path = tmp.name
+
+    try:
+        from ML.dags.audioemotion import process_uploaded_audio
+        audio_emotion = process_uploaded_audio(tmp_path)   # <-- pass path instead of bytes
+    except Exception as e:
+        audio_emotion = {"error": str(e)}
+
+    # Save permanently if requested
+    if save_flag:
+        filepath = os.path.join("uploads", file.filename)
+        os.makedirs("uploads", exist_ok=True)
+        with open(filepath, "wb") as f:
+            f.write(audio_cache)
+        return jsonify({
+            "file": file.filename,
+            "status": "saved",
+            "emotion": audio_emotion
+        })
+
+    return jsonify({
+        "file": file.filename,
+        "status": "cached",
+        "emotion": audio_emotion
+    })
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/start-video", methods=["GET"])
+def start_video_alias():
+    return jsonify({"status": "Use /video_feed for streaming"})
+
+@app.route("/analyze-text/<text>", methods=["GET"])
+def analyze_text(text):
+    sentiment = analyze_text_sentiment(text)
+    return jsonify(sentiment)
+CLIENT_ID = "Ov23ligkzwQ4k2mhI40y"
+CLIENT_SECRET = "73915d3b78fc3b0af4cdcfa0e3a7472edcd64876"
+
+@app.route("/api/github/callback")
+def github_callback():
+    code = request.args.get("code")
+    token_res = requests.post(
+        "https://github.com/login/oauth/access_token",
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "code": code,
+        },
+        headers={"Accept": "application/json"}
+    )
+    token_json = token_res.json()
+    access_token = token_json.get("access_token")
+
+    user_res = requests.get(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    user_data = user_res.json()
+    return jsonify(user_data)
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+@app.route("/chatbot-gemini", methods=["POST"])
+def chatbot_gemini():
+    try:
+        data = request.get_json()
+        if not data or "text" not in data:
+            return jsonify({"error": "Please provide text"}), 400
+
+        user_text = data["text"]
+
+        # Local emotion detection (optional)
+        sentiment = analyze_text_sentiment(user_text)
+
+        # Ask Gemini to respond empathetically
+        model = genai.GenerativeModel("gemini-1.5-flash")  # or gemini-pro
+        response = model.generate_content(
+            f"You are an empathetic chatbot. User feels: {sentiment[0]['label']}. "
+            f"Message: {user_text}"
+        )
+
+        bot_reply = response.text
+
+        return jsonify({
+            "user": user_text,
+            "sentiment": sentiment,
+            "bot": bot_reply
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
