@@ -1,79 +1,109 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Emotion Classifier</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 50px;
-            background: #f5f5f5;
-        }
-        h1 {
-            color: #333;
-        }
-        textarea {
-            width: 100%;
-            height: 100px;
-            margin-bottom: 10px;
-            padding: 10px;
-            font-size: 16px;
-        }
-        button {
-            background: #007BFF;
-            color: white;
-            border: none;
-            padding: 10px 15px;
-            cursor: pointer;
-            border-radius: 5px;
-        }
-        button:hover {
-            background: #0056b3;
-        }
-        #result {
-            margin-top: 20px;
-            padding: 15px;
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0px 2px 5px rgba(0,0,0,0.1);
-        }
-    </style>
+  <meta charset="UTF-8">
+  <title>Emotion Classifier</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 50px; background: #f5f5f5; }
+    h1 { color: #333; }
+    textarea { width: 100%; height: 100px; margin-bottom: 10px; padding: 10px; font-size: 16px; }
+    button { background: #007BFF; color: white; border: none; padding: 10px 15px; cursor: pointer; border-radius: 5px; margin: 5px; }
+    button:hover { background: #0056b3; }
+    #result { margin-top: 20px; padding: 15px; background: #fff; border-radius: 8px; box-shadow: 0px 2px 5px rgba(0,0,0,0.1); }
+  </style>
 </head>
 <body>
-    <h1>Emotion Classifier</h1>
-    <form id="emotionForm">
-        <textarea id="textInput" placeholder="Type something..."></textarea><br>
-        <button type="submit">Analyze Emotion</button>
-    </form>
+  <h1>Emotion Classifier</h1>
 
-    <div id="result"></div>
+  <form id="emotionForm">
+    <textarea id="textInput" placeholder="Type something..."></textarea><br>
+    <button type="submit">Analyze Emotion</button>
+  </form>
 
-    <button id="startVideoBtn">cam</button>
+  <div id="result"></div>
 
-    <script>
-        document.getElementById("emotionForm").addEventListener("submit", async function(e) {
-            e.preventDefault();
-            const text = document.getElementById("textInput").value;
-            const response = await fetch("/chat", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: text })
+  <button id="startVideoBtn">Start Camera</button>
+  <button id="startAudioBtn">🎙️ Start Recording</button>
+  <button id="stopAudioBtn" disabled>⏹️ Stop Recording</button>
+
+  <script>
+    // -------- Text Emotion --------
+    document.getElementById("emotionForm").addEventListener("submit", async function(e) {
+      e.preventDefault();
+      const text = document.getElementById("textInput").value;
+      const response = await fetch("/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text })
+      });
+      const data = await response.json();
+      document.getElementById("result").innerHTML =
+        "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
+    });
+
+    // -------- Video --------
+    document.getElementById("startVideoBtn").addEventListener("click", async () => {
+      try {
+        const response = await fetch("/video");
+        const result = await response.json();
+        alert(result.status || result.error);
+      } catch (err) {
+        alert("Error starting video: " + err);
+      }
+    });
+
+    // -------- Audio --------
+    let mediaRecorder;
+    let audioChunks = [];
+
+    const startBtn = document.getElementById("startAudioBtn");
+    const stopBtn = document.getElementById("stopAudioBtn");
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = event => {
+          if (event.data.size > 0) {
+            audioChunks.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+          const formData = new FormData();
+          formData.append("file", audioBlob, "recording.webm");
+
+          try {
+            const response = await fetch("/audio", {
+              method: "POST",
+              body: formData
             });
-            const data = await response.json();
+            const result = await response.json();
             document.getElementById("result").innerHTML =
-                "<pre>" + JSON.stringify(data, null, 2) + "</pre>";
-        });
+              "<pre>" + JSON.stringify(result, null, 2) + "</pre>";
+          } catch (err) {
+            alert("Error sending audio: " + err);
+          }
+        };
 
-        const button = document.getElementById("startVideoBtn");
-        button.addEventListener("click", async() =>{
-            try {
-                const response = await fetch("/video");
-                const result = await response.json();
-                alert(result.status || result.error);
-            } catch (err) {
-                alert("Error starting video: " + err);
-            }
-        })
-    </script>
+        mediaRecorder.start();
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } catch (err) {
+        alert("Error accessing microphone: " + err);
+      }
+    });
+
+    stopBtn.addEventListener("click", () => {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+  </script>
 </body>
 </html>
